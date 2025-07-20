@@ -1,0 +1,100 @@
+-- Table: users
+CREATE TABLE "users" (
+    "username" VARCHAR(50) PRIMARY KEY,
+    "password_hash" VARCHAR(255) NOT NULL
+);
+
+-- Table: items
+CREATE TABLE "items" (
+    "item_id" VARCHAR(50) PRIMARY KEY,
+    "item_name" VARCHAR(255) NOT NULL,
+    "quantity" INT NOT NULL,
+    "price" DECIMAL(10, 2) NOT NULL,
+    "bought_price" DECIMAL(10, 2) NOT NULL
+);
+
+-- Table: sales
+CREATE TABLE "sales" (
+    "sale_number" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "sale_date" DATE NOT NULL,
+    "username" VARCHAR(50) NOT NULL,
+    "total_amount" DECIMAL(10, 2) NOT NULL,
+    FOREIGN KEY("username") REFERENCES "users"("username")
+);
+
+-- Table: sale_items (Crucially corrected version)
+CREATE TABLE "sale_items" (
+    "sale_item_id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "sale_number" INTEGER NOT NULL,
+    "item_id" VARCHAR(50) NOT NULL, -- Ensure this matches items.item_id type
+    "item_name" VARCHAR(255) NOT NULL,
+    "unit_price" DECIMAL(10, 2) NOT NULL, -- Corrected: single numeric column
+    "quantity" INTEGER NOT NULL,
+    "discount_percent" DECIMAL(5, 2) NOT NULL,
+    "total_price" DECIMAL(10, 2) NOT NULL,
+    FOREIGN KEY("item_id") REFERENCES "items"("item_id"),
+    FOREIGN KEY("sale_number") REFERENCES "sales"("sale_number")
+);
+
+-- Table: suppliers
+CREATE TABLE "suppliers" (
+    "supplier_name" VARCHAR(255) PRIMARY KEY
+);
+
+-- Table: supplier_transactions
+CREATE TABLE "supplier_transactions" (
+    "transaction_id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "transaction_date" DATE NOT NULL,
+    "supplier_name" VARCHAR(255) NOT NULL,
+    "total_amount" DECIMAL(10, 2) NOT NULL,
+    "paid_amount" DECIMAL(10, 2) NOT NULL,
+    FOREIGN KEY("supplier_name") REFERENCES "suppliers"("supplier_name")
+);
+
+-- Table: supplier_payments (Crucially corrected version)
+CREATE TABLE "supplier_payments" (
+    "payment_id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "transaction_id" INTEGER NOT NULL,
+    "payment_date" DATE NOT NULL,
+    "amount" DECIMAL(10, 2) NOT NULL, -- Corrected: no space
+    FOREIGN KEY("transaction_id") REFERENCES "supplier_transactions"("transaction_id")
+);
+
+-- Table: returns_history
+CREATE TABLE "returns_history" (
+    "return_id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "return_date" DATE NOT NULL,
+    "username" VARCHAR(50) NOT NULL,
+    "item_id" VARCHAR(50) NOT NULL,
+    "item_name" VARCHAR(255) NOT NULL,
+    "quantity" INTEGER NOT NULL,
+    "refund_amount" DECIMAL(10, 2) NOT NULL,
+    "reason" TEXT NOT NULL,
+    FOREIGN KEY("item_id") REFERENCES "items"("item_id"),
+    FOREIGN KEY("username") REFERENCES "users"("username")
+);
+
+-- Table: customers
+CREATE TABLE "customers" (
+    "customer_name" VARCHAR(255) PRIMARY KEY
+);
+
+-- Table: indebtedness_entries
+CREATE TABLE "indebtedness_entries" (
+    "dept_id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "customer_name" VARCHAR(255) NOT NULL,
+    "dept_date" DATE NOT NULL,
+    "goods_description" VARCHAR(255) NOT NULL,
+    "amount_owed" DECIMAL(10, 2) NOT NULL,
+    "amount_paid" DECIMAL(10, 2) NOT NULL,
+    FOREIGN KEY("customer_name") REFERENCES "customers"("customer_name")
+);
+
+-- Table: indebtedness_payments
+CREATE TABLE "indebtedness_payments" (
+    "payment_id" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "debt_id" INTEGER NOT NULL,
+    "payment_date" DATE NOT NULL,
+    "amount" DECIMAL(10, 2) NOT NULL,
+    FOREIGN KEY("debt_id") REFERENCES "indebtedness_entries"("dept_id")
+);
