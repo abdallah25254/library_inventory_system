@@ -1,4 +1,4 @@
-﻿// mainwindow.h - REVISED based on dynamic user tabs
+// mainwindow.h - REVISED based on dynamic user tabs
 #pragma once
 #include <QDateEdit>
 #include <QMainWindow>
@@ -10,6 +10,11 @@
 #include <QListWidget>
 #include <QTextEdit>
 #include <QTimer>
+#include <QKeyEvent>
+#include <QFile>
+#include <QDir>
+#include <QStandardPaths>
+#include <QCoreApplication>
 #include "library_project.h" // Include your LibraryInventory header
 
 class MainWindow : public QMainWindow {
@@ -23,14 +28,19 @@ public:
 signals:
     void logoutRequested();
 
+protected:
+    bool eventFilter(QObject* obj, QEvent* event) override;
+
 private slots:
 
     void setupDeficienciesTab(); // NEW
     void refreshDeficienciesTable(); // NEW
+    void checkAndNotifyLowStock(); // NEW: popup alert for items below threshold
     void addItemToInventory(); // This slot might become less relevant if adding items from DB always
     void addItemToOrder();
     void completeCurrentOrder();
     void cancelCurrentOrder();
+    void printReceipt(int saleNumber); // NEW: Print receipt function
     void searchItem();
     void updateOrderTotal();
     void applyModernStyling();
@@ -42,6 +52,10 @@ private slots:
     void addSupplierPayment(const std::string& supplierName, QDateEdit* paymentDateInput, QLineEdit* paymentInput, QFrame* summaryCard, QTableWidget* table); // Added QDateEdit
     void showPaymentHistory(const std::string& supplierName, int transactionIndex);
     void showInventoryManagement();
+    void editInventoryItem(const QString& itemId, QTableWidget* inventoryTableDialog,
+        std::function<void()> refreshFn);
+    void deleteInventoryItem(const QString& itemId, QTableWidget* inventoryTableDialog,
+        std::function<void()> refreshFn);
 
     void onSearchInputTextChanged(const QString& text);
     void onSuggestionItemSelected(QListWidgetItem* item);
@@ -75,17 +89,20 @@ private:
     QLineEdit* itemQuantityInput;
     QLineEdit* itemPriceInput;
     QLineEdit* boughtPriceInput;
+    QLineEdit* itemThresholdInput;  // NEW: per-item low-stock threshold
     QPushButton* addItemButton;
 
     // Order Tab elements
     QTableWidget* orderTable;
     QLineEdit* orderItemIdInput;
+    QListWidget* orderItemSuggestionsList;   // name-search dropdown
     QLineEdit* orderQuantityInput;
     QLineEdit* orderDiscountInput;
     QPushButton* addToOrderButton;
     QPushButton* completeOrderButton;
     QPushButton* cancelOrderButton;
     QPushButton* deorderButton;
+    QPushButton* printReceiptButton; // NEW: Print receipt button
     QLabel* orderTotalLabel;
 
     // Search Tab elements
@@ -99,6 +116,7 @@ private:
     QPushButton* totalHistoryButton;
     QPushButton* suppliersButton;
     QPushButton* inventoryButton;
+    QPushButton* backupButton;
 
     // Supplier Dashboard elements
     QTabWidget* supplierTabWidget;
@@ -142,9 +160,18 @@ private:
     std::map<std::string, QTableWidget*> userHistoryTables;
 
     // For deficiencies tab
-    QTableWidget* deficienciesTable; // NEW: Table for deficiencies tab
+    QTableWidget* deficienciesTable;
     QTimer* deficienciesRefreshTimer;
+    bool    lowStockNotifiedThisSession_ = false; // shows popup only once per login
+    QString lastBackupStatus_;          // set by performStartupBackup()
+    bool    lastBackupOk_ = false;          // true = backup succeeded
+    QLabel* backupStatusLabel_ = nullptr;   // small pill label in header
 
+
+    // Backup
+    void performStartupBackup();
+    void showBackupManager();
+    void showBackupStartupResult();   // shows result toast after UI ready
 
     // Helper functions
     QFrame* createSummaryCard(const QString& title, const QString& value, const QString& color);
