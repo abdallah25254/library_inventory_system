@@ -1,4 +1,4 @@
-﻿#include "library_project.h"
+#include "library_project.h"
 #include <algorithm>
 #include <stdexcept>
 #include <numeric>
@@ -13,15 +13,20 @@ LibraryInventory::LibraryInventory() {
     // Database connection is now managed externally (e.g., in main.cpp)
 }
 
-void LibraryInventory::addItem(const std::string& id, const std::string& name, int quantity, double price, double boughtPrice) {
+void LibraryInventory::addItem(const std::string& id, const std::string& name,
+    int quantity, double price, double boughtPrice, int threshold) {
     QSqlQuery query;
-    query.prepare("INSERT OR REPLACE INTO items (item_id, item_name, quantity, price, bought_price) "
-        "VALUES (:item_id, :item_name, :quantity, :price, :bought_price)");
+    query.prepare(
+        "INSERT OR REPLACE INTO items "
+        "(item_id, item_name, quantity, price, bought_price, threshold) "
+        "VALUES (:item_id, :item_name, :quantity, :price, :bought_price, :threshold)"
+    );
     query.bindValue(":item_id", QString::fromStdString(id));
     query.bindValue(":item_name", QString::fromStdString(name));
     query.bindValue(":quantity", quantity);
     query.bindValue(":price", price);
     query.bindValue(":bought_price", boughtPrice);
+    query.bindValue(":threshold", threshold);
 
     if (!query.exec()) {
         qDebug() << "Error adding/updating item:" << query.lastError().text();
@@ -167,7 +172,10 @@ void LibraryInventory::cancelOrder() {
 
 std::map<std::string, Item> LibraryInventory::getInventory() const {
     std::map<std::string, Item> inventoryMap;
-    QSqlQuery query("SELECT item_id, item_name, quantity, price, bought_price FROM items");
+    QSqlQuery query(
+        "SELECT item_id, item_name, quantity, price, bought_price, "
+        "COALESCE(threshold, 5) AS threshold FROM items"
+    );
 
     if (!query.exec()) {
         qDebug() << "Error getting inventory:" << query.lastError().text();
@@ -181,9 +189,34 @@ std::map<std::string, Item> LibraryInventory::getInventory() const {
         item.quantity = query.value("quantity").toInt();
         item.price = query.value("price").toDouble();
         item.boughtPrice = query.value("bought_price").toDouble();
+        item.threshold = query.value("threshold").toInt();
         inventoryMap[item.id] = item;
     }
     return inventoryMap;
+}
+
+std::vector<Item> LibraryInventory::getItemsBelowThreshold() const {
+    std::vector<Item> lowItems;
+    QSqlQuery query(
+        "SELECT item_id, item_name, quantity, price, bought_price, "
+        "COALESCE(threshold, 5) AS threshold FROM items "
+        "WHERE quantity < COALESCE(threshold, 5)"
+    );
+    if (!query.exec()) {
+        qDebug() << "Error checking low stock:" << query.lastError().text();
+        return lowItems;
+    }
+    while (query.next()) {
+        Item item;
+        item.id = query.value("item_id").toString().toStdString();
+        item.name = query.value("item_name").toString().toStdString();
+        item.quantity = query.value("quantity").toInt();
+        item.price = query.value("price").toDouble();
+        item.boughtPrice = query.value("bought_price").toDouble();
+        item.threshold = query.value("threshold").toInt();
+        lowItems.push_back(item);
+    }
+    return lowItems;
 }
 
 const std::vector<OrderItem>& LibraryInventory::getCurrentOrder() const {
