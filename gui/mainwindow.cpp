@@ -1,5 +1,7 @@
-﻿// mainwindow.cpp - REVISED with Enter key default button and auto-tabbing on scan
+// mainwindow.cpp - REVISED with Enter key default button and auto-tabbing on scan
+//old version
 #include "mainwindow.h"
+#include <QDateTime>
 #include <QVBoxLayout>
 #include <QDateEdit>
 #include <QHBoxLayout>
@@ -22,14 +24,35 @@
 
 // For database operations
 #include <QSqlDatabase>
+#include <QFile>
+#include <QDir>
+#include <QFileInfo>
+#include <QStandardPaths>
+#include <QFileDialog>
+#include <QApplication>
+#include <QCoreApplication>
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QVariant>
+#include <QPrinter>
+#include <QPrintDialog>
+#include <QPainter>
+#include <QPageSize>
+#include <QTextDocument>
+#include <QPageLayout>
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+    // DB migration: add threshold column to existing databases that don't have it yet
+    {
+        QSqlQuery migration;
+        migration.exec("ALTER TABLE items ADD COLUMN threshold INTEGER DEFAULT 5");
+    }
+    performStartupBackup();   // Auto-backup before anything else touches the DB
     setupUI();
-    //initializeInventory(); // Call this to ensure some initial data is in the DB if it's empty
     updateUserDisplay();
+    // Show backup result after UI is ready, then low-stock check
+    QTimer::singleShot(600, this, &MainWindow::showBackupStartupResult);
+    QTimer::singleShot(1400, this, &MainWindow::checkAndNotifyLowStock);
 }
 
 void MainWindow::showSuppliersDashboard() {
@@ -38,7 +61,7 @@ void MainWindow::showSuppliersDashboard() {
         "Enter admin password:", QLineEdit::Password,
         "", &ok);
 
-    if (ok && !password.isEmpty() && password == "25254amm") {
+    if (ok && !password.isEmpty() && password == "25254") {
         QDialog* dialog = new QDialog(this);
         dialog->setWindowTitle("Suppliers Dashboard");
         dialog->setMinimumSize(1200, 800);
@@ -92,6 +115,7 @@ void MainWindow::showSuppliersDashboard() {
         submitSupplierButton->setMinimumHeight(45);
         formLayout->addWidget(submitSupplierButton);
         formLayout->addStretch();
+        //-----------------------------------------------------------//
 
         // Set submitSupplierButton as the default button for this dialog
         submitSupplierButton->setDefault(true);
@@ -303,7 +327,7 @@ void MainWindow::showTotalSalesHistory() {
         "", &ok);
 
     if (ok && !password.isEmpty()) {
-        if (password == "25254amm") {
+        if (password == "25254") {
             QDialog dialog(this);
             dialog.setWindowTitle("Admin Sales & Returns Dashboard");
             dialog.setMinimumSize(1000, 800);
@@ -1067,6 +1091,8 @@ void MainWindow::updateUserDisplay() {
 void MainWindow::setCurrentUser(const std::string& username) {
     inventory.setCurrentUser(username);
     updateUserDisplay();
+    // Reset so the low-stock popup fires once for this new login session
+    lowStockNotifiedThisSession_ = false;
 }
 
 
@@ -1119,9 +1145,15 @@ void MainWindow::setupUI() {
     userLabel = new QLabel("Welcome, Admin");
     userLabel->setObjectName("userLabel");
 
-    headerLayout->addWidget(logoLabel);
-    headerLayout->addWidget(titleLabel);
-    headerLayout->addStretch();
+    // Backup status label — shown in header after startup
+    backupStatusLabel_ = new QLabel("Backup...");
+    backupStatusLabel_->setStyleSheet(
+        "font-size:11px; color:rgba(255,255,255,0.85);"
+        "background-color:rgba(100,100,100,0.4);"
+        "border-radius:10px; padding:3px 10px;");
+    backupStatusLabel_->setToolTip("Checking backup status...");
+    headerLayout->addWidget(backupStatusLabel_);
+    headerLayout->addSpacing(10);
     headerLayout->addWidget(userLabel);
 
     tabWidget = new QTabWidget();
@@ -1153,6 +1185,10 @@ void MainWindow::setupUI() {
     inventoryButton->setCursor(Qt::PointingHandCursor);
     inventoryButton->setFixedSize(120, 30);
 
+    backupButton = new QPushButton("💾 Backup");
+    backupButton->setObjectName("adminButton");
+    backupButton->setCursor(Qt::PointingHandCursor);
+    backupButton->setFixedSize(100, 30);
 
     headerLayout->addWidget(totalHistoryButton);
     headerLayout->addSpacing(10);
@@ -1160,13 +1196,15 @@ void MainWindow::setupUI() {
     headerLayout->addSpacing(10);
     headerLayout->addWidget(inventoryButton);
     headerLayout->addSpacing(10);
+    headerLayout->addWidget(backupButton);
+    headerLayout->addSpacing(10);
     headerLayout->addWidget(logoutButton);
-
 
     connect(logoutButton, &QPushButton::clicked, this, &MainWindow::handleLogout);
     connect(totalHistoryButton, &QPushButton::clicked, this, &MainWindow::showTotalSalesHistory);
     connect(suppliersButton, &QPushButton::clicked, this, &MainWindow::showSuppliersDashboard);
     connect(inventoryButton, &QPushButton::clicked, this, &MainWindow::showInventoryManagement);
+    connect(backupButton, &QPushButton::clicked, this, &MainWindow::showBackupManager);
 
     // NEW: Connect tab changes to manage default buttons and deficiencies timer
     connect(tabWidget, &QTabWidget::currentChanged, this, [this](int index) {
@@ -1244,7 +1282,7 @@ void MainWindow::setupOrderTab() {
     QFrame* orderFormFrame = new QFrame();
     orderFormFrame->setObjectName("cardFrame");
     orderFormFrame->setFixedWidth(320);
-    orderFormFrame->setMaximumHeight(350);
+    orderFormFrame->setMaximumHeight(520);
 
     QVBoxLayout* formLayout = new QVBoxLayout(orderFormFrame);
     formLayout->setContentsMargins(25, 25, 25, 25);
@@ -1258,24 +1296,136 @@ void MainWindow::setupOrderTab() {
 
     QVBoxLayout* orderIdLayout = new QVBoxLayout();
     orderIdLayout->setSpacing(5);
-    QLabel* orderIdLabel = new QLabel("Item ID");
+    QLabel* orderIdLabel = new QLabel("Item ID / Name Search");
     orderIdLabel->setObjectName("fieldLabel");
     orderItemIdInput = new QLineEdit();
     orderItemIdInput->setObjectName("styledInput");
-    orderItemIdInput->setPlaceholderText("Enter item ID");
+    orderItemIdInput->setPlaceholderText("Scan barcode or type item name...");
     orderIdLayout->addWidget(orderIdLabel);
     orderIdLayout->addWidget(orderItemIdInput);
 
-    // NEW: Auto-tabbing for orderItemIdInput
+    // Name-search dropdown list (hidden until user types a name)
+    orderItemSuggestionsList = new QListWidget();
+    orderItemSuggestionsList->setObjectName("orderSuggestionsList");
+    orderItemSuggestionsList->setMaximumHeight(180);
+    orderItemSuggestionsList->hide();
+    orderItemSuggestionsList->setStyleSheet(R"(
+        QListWidget#orderSuggestionsList {
+            border: 2px solid #667eea;
+            border-radius: 8px;
+            background-color: white;
+            font-size: 13px;
+            padding: 4px;
+        }
+        QListWidget#orderSuggestionsList::item {
+            padding: 8px 10px;
+            border-bottom: 1px solid #f0f0f0;
+            color: #2c3e50;
+        }
+        QListWidget#orderSuggestionsList::item:last {
+            border-bottom: none;
+        }
+        QListWidget#orderSuggestionsList::item:hover {
+            background-color: #eef1ff;
+            color: #667eea;
+        }
+        QListWidget#orderSuggestionsList::item:selected {
+            background-color: #667eea;
+            color: white;
+        }
+    )");
+    orderIdLayout->addWidget(orderItemSuggestionsList);
+
+    // textChanged: search by ID or name and populate dropdown
     connect(orderItemIdInput, &QLineEdit::textChanged, this, [this](const QString& text) {
+        orderItemSuggestionsList->clear();
+        if (text.isEmpty()) {
+            orderItemSuggestionsList->hide();
+            return;
+        }
+
+        // If text is purely numeric (barcode scan in progress), skip name search
+        bool isNumeric = true;
+        for (const QChar& ch : text) {
+            if (!ch.isDigit()) { isNumeric = false; break; }
+        }
+        if (isNumeric) {
+            orderItemSuggestionsList->hide();
+            return;
+        }
+
+        // Search inventory by name (and ID fallback)
+        const auto& inv = inventory.getInventory();
+        QString lower = text.toLower();
+        int count = 0;
+        for (const auto& pair : inv) {
+            const Item& item = pair.second;
+            QString itemName = QString::fromStdString(item.name);
+            QString itemId = QString::fromStdString(item.id);
+            if (itemName.toLower().contains(lower) || itemId.toLower().contains(lower)) {
+                // Format: "Name  |  ID  |  Qty: X  |  LE price"
+                QString display = QString("%1   [%2]   Qty: %3   LE %4")
+                    .arg(itemName)
+                    .arg(itemId)
+                    .arg(item.quantity)
+                    .arg(item.price, 0, 'f', 2);
+                QListWidgetItem* listItem = new QListWidgetItem(display);
+                // Store the actual item_id as user data so we can retrieve it on click
+                listItem->setData(Qt::UserRole, itemId);
+                if (item.quantity == 0) {
+                    listItem->setForeground(QColor("#adb5bd")); // grey out out-of-stock
+                    listItem->setToolTip("Out of stock");
+                }
+                orderItemSuggestionsList->addItem(listItem);
+                if (++count >= 8) break; // cap at 8 results
+            }
+        }
+
+        if (orderItemSuggestionsList->count() > 0) {
+            orderItemSuggestionsList->show();
+        }
+        else {
+            orderItemSuggestionsList->hide();
+        }
+        });
+
+    // Clicking a suggestion fills the ID field and moves to quantity
+    connect(orderItemSuggestionsList, &QListWidget::itemClicked, this,
+        [this](QListWidgetItem* listItem) {
+            QString selectedId = listItem->data(Qt::UserRole).toString();
+            orderItemIdInput->setText(selectedId);
+            orderItemSuggestionsList->hide();
+            orderItemSuggestionsList->clear();
+            orderQuantityInput->setFocus();
+            orderQuantityInput->selectAll();
+        });
+
+    // Auto-tabbing for orderItemIdInput (barcode scan Enter)
+    connect(orderItemIdInput, &QLineEdit::returnPressed, this, [this]() {
+        QString text = orderItemIdInput->text().trimmed();
         if (text.isEmpty()) return;
-        // Check if the entered text is a valid item ID in the inventory
-        // Now checks database
+
+        // If suggestion list is visible and has items, pick the first one
+        if (orderItemSuggestionsList->isVisible() && orderItemSuggestionsList->count() > 0) {
+            QListWidgetItem* first = orderItemSuggestionsList->item(0);
+            QString selectedId = first->data(Qt::UserRole).toString();
+            orderItemIdInput->setText(selectedId);
+            orderItemSuggestionsList->hide();
+            orderItemSuggestionsList->clear();
+            orderQuantityInput->setFocus();
+            orderQuantityInput->selectAll();
+            return;
+        }
+
+        // Normal barcode path: check DB and move to quantity
         QSqlQuery query;
         query.prepare("SELECT COUNT(*) FROM items WHERE item_id = :item_id");
         query.bindValue(":item_id", text);
         if (query.exec() && query.next() && query.value(0).toInt() > 0) {
-            orderQuantityInput->setFocus(); // Move focus to quantity input
+            orderQuantityInput->setFocus();
+        }
+        else {
+            orderItemIdInput->selectAll();
         }
         });
 
@@ -1361,6 +1511,14 @@ void MainWindow::setupOrderTab() {
     deorderButton->setMinimumWidth(160);
     deorderButton->setCursor(Qt::PointingHandCursor);
 
+    // NEW: Print Receipt Button
+    printReceiptButton = new QPushButton("Print Last Receipt");
+    printReceiptButton->setObjectName("primaryButton");
+    printReceiptButton->setMinimumHeight(45);
+    printReceiptButton->setMinimumWidth(140);
+    printReceiptButton->setCursor(Qt::PointingHandCursor);
+    printReceiptButton->setEnabled(false); // Disabled initially until an order is completed
+
 
     orderTotalLabel = new QLabel("Total: LE0.00");
     orderTotalLabel->setObjectName("totalLabel");
@@ -1368,6 +1526,7 @@ void MainWindow::setupOrderTab() {
     actionsLayout->addWidget(completeOrderButton);
     actionsLayout->addWidget(cancelOrderButton);
     actionsLayout->addWidget(deorderButton); // Add the new button
+    actionsLayout->addWidget(printReceiptButton); // NEW: Add print receipt button
     actionsLayout->addStretch();
     actionsLayout->addWidget(orderTotalLabel);
 
@@ -1378,10 +1537,32 @@ void MainWindow::setupOrderTab() {
     mainLayout->addWidget(orderFormFrame);
     mainLayout->addWidget(orderTableFrame);
 
+    // Enter on Quantity --> move focus to Discount
+    connect(orderQuantityInput, &QLineEdit::returnPressed, this, [this]() {
+        if (!orderQuantityInput->text().trimmed().isEmpty())
+            orderDiscountInput->setFocus();
+        });
+
+    // Enter on Discount (or when discount is empty and user hits Enter) --> Add to Order
+    connect(orderDiscountInput, &QLineEdit::returnPressed, this, &MainWindow::addItemToOrder);
+
     connect(addToOrderButton, &QPushButton::clicked, this, &MainWindow::addItemToOrder);
     connect(completeOrderButton, &QPushButton::clicked, this, &MainWindow::completeCurrentOrder);
     connect(cancelOrderButton, &QPushButton::clicked, this, &MainWindow::cancelCurrentOrder);
     connect(deorderButton, &QPushButton::clicked, this, &MainWindow::onDeorderItemClicked); // Connect new button
+    connect(printReceiptButton, &QPushButton::clicked, this, [this]() {
+        // Get the last sale number from the database
+        QSqlQuery query;
+        query.prepare("SELECT MAX(sale_number) FROM sales WHERE username = :username");
+        query.bindValue(":username", QString::fromStdString(inventory.getCurrentUser()));
+        if (query.exec() && query.next()) {
+            int lastSaleNumber = query.value(0).toInt();
+            if (lastSaleNumber > 0) {
+                printReceipt(lastSaleNumber);
+            }
+        }
+        });
+
 
     tabWidget->addTab(orderTab, "🛒 New Order");
 }
@@ -1410,6 +1591,8 @@ void MainWindow::setupSearchTab() {
     searchInput = new QLineEdit();
     searchInput->setObjectName("styledInput");
     searchInput->setPlaceholderText("Enter item ID or name to search...");
+    // FIX: Connect the scanner's "Enter" key to the search function
+    connect(searchInput, &QLineEdit::returnPressed, this, &MainWindow::searchItem);
     searchInput->setMinimumHeight(40);
 
     searchButton = new QPushButton("Search");
@@ -1498,13 +1681,13 @@ void MainWindow::setupDeficienciesTab() {
     tableLayout->setContentsMargins(25, 25, 25, 25);
     tableLayout->setSpacing(15);
 
-    QLabel* tableTitle = new QLabel("Inventory Deficiencies (< 8 items)");
+    QLabel* tableTitle = new QLabel("Inventory Deficiencies (below per-item threshold)");
     tableTitle->setObjectName("sectionTitle");
 
     deficienciesTable = new QTableWidget(); // Initialize the member variable
     deficienciesTable->setObjectName("styledTable");
-    deficienciesTable->setColumnCount(3); // Item ID, Item Name, Current Quantity
-    deficienciesTable->setHorizontalHeaderLabels({ "Item ID", "Item Name", "Current Quantity" });
+    deficienciesTable->setColumnCount(4); // Item ID, Item Name, Current Qty, Threshold
+    deficienciesTable->setHorizontalHeaderLabels({ "Item ID", "Item Name", "Current Qty", "Threshold" });
     deficienciesTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     deficienciesTable->setAlternatingRowColors(true);
     deficienciesTable->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -1767,6 +1950,7 @@ void MainWindow::clearInventoryForm() {
     itemQuantityInput->clear();
     itemPriceInput->clear();
     boughtPriceInput->clear();
+    itemThresholdInput->clear();
 }
 
 void MainWindow::refreshOrderTable() {
@@ -1873,18 +2057,31 @@ void MainWindow::completeCurrentOrder() {
     }
 
     if (inventory.completeOrder()) {
-        QMessageBox::information(this, "Order Completed",
-            QString("Order completed successfully!\nTotal: %1")
-            .arg(orderTotalLabel->text()));
+        // Get the sale number of the just-completed order
+        QSqlQuery query;
+        query.prepare("SELECT MAX(sale_number) FROM sales WHERE username = :username");
+        query.bindValue(":username", QString::fromStdString(inventory.getCurrentUser()));
+        int lastSaleNumber = 0;
+        if (query.exec() && query.next()) {
+            lastSaleNumber = query.value(0).toInt();
+        }
 
-        refreshOrderTable(); // Clears the current order display
-        searchItem(); // Refresh search results (shows all if no search term)
-        refreshDeficienciesTable(); // Refresh deficiencies
-        // If the detailed history dashboard is open, refresh it as well.
-        // This is complex as it would need access to its dialog,
-        // so for now, it relies on re-opening the dashboard to see updates.
-        // Or, if `refreshDetailedSalesReturnsTable` was a direct member, could call here.
-        // For simplicity, we rely on the user to re-open Admin History.
+        QMessageBox::StandardButton reply;
+        reply = QMessageBox::question(this, "Order Completed",
+            QString("Order completed successfully!\nTotal: %1\n\nWould you like to print the receipt?")
+            .arg(orderTotalLabel->text()),
+            QMessageBox::Yes | QMessageBox::No);
+
+        if (reply == QMessageBox::Yes && lastSaleNumber > 0) {
+            printReceipt(lastSaleNumber);
+        }
+
+        // Enable the print receipt button for later printing if needed
+        printReceiptButton->setEnabled(true);
+
+        refreshOrderTable();
+        searchItem();
+        refreshDeficienciesTable();
     }
     else {
         QMessageBox::warning(this, "Order Error", "Failed to complete order. No user logged in or other issue.");
@@ -1892,11 +2089,6 @@ void MainWindow::completeCurrentOrder() {
 }
 
 void MainWindow::cancelCurrentOrder() {
-    if (inventory.getCurrentOrder().empty()) {
-        QMessageBox::warning(this, "Error", "No current order to cancel");
-        return;
-    }
-
     inventory.cancelOrder();
     refreshOrderTable(); // Clears the current order display
     searchItem(); // Refresh search results (shows all if no search term)
@@ -1904,44 +2096,105 @@ void MainWindow::cancelCurrentOrder() {
     QMessageBox::information(this, "Order Cancelled", "Current order has been cancelled");
 }
 
-void MainWindow::searchItem() {
-    QString query = searchInput->text().trimmed(); // Trim whitespace
-    const auto& inv = inventory.getInventory(); // Get current inventory from DB
 
-    searchResultsTable->setRowCount(0); // Clear previous results
-    std::vector<Item> results;
+void MainWindow::printReceipt(int saleNumber) {
+    // 1. Fetch sale header
+    QSqlQuery saleQuery;
+    saleQuery.prepare("SELECT sale_date, total_amount, username FROM sales WHERE sale_number = :id");
+    saleQuery.bindValue(":id", saleNumber);
+    if (!saleQuery.exec() || !saleQuery.next()) {
+        QMessageBox::warning(this, "Print Error", "Could not find sale details.");
+        return;
+    }
+    QString saleDate = saleQuery.value("sale_date").toString();
+    double  totalAmount = saleQuery.value("total_amount").toDouble();
+    QString username = saleQuery.value("username").toString();
 
-    for (const auto& pair : inv) {
-        const Item& item = pair.second;
-        if (query.isEmpty() || QString::fromStdString(item.id).contains(query, Qt::CaseInsensitive) ||
-            QString::fromStdString(item.name).contains(query, Qt::CaseInsensitive)) {
-            results.push_back(item);
-        }
+    // 2. Fetch sale items
+    QSqlQuery itemsQuery;
+    itemsQuery.prepare("SELECT item_name, quantity, unit_price, discount_percent, total_price "
+        "FROM sale_items WHERE sale_number = :id");
+    itemsQuery.bindValue(":id", saleNumber);
+    itemsQuery.exec();
+
+    // 3. Build HTML item rows
+    QString itemRows;
+    while (itemsQuery.next()) {
+        QString name = itemsQuery.value("item_name").toString().toHtmlEscaped();
+        int     qty = itemsQuery.value("quantity").toInt();
+        double  price = itemsQuery.value("unit_price").toDouble();
+        double  discount = itemsQuery.value("discount_percent").toDouble();
+        double  total = itemsQuery.value("total_price").toDouble();
+        QString disc = (discount > 0) ? QString("%1%").arg(discount, 0, 'f', 1) : QString("-");
+
+        itemRows += QString(
+            "<tr>"
+            "<td style='padding:6px 8px;border-bottom:1px solid #ddd;'>%1</td>"
+            "<td style='padding:6px 8px;border-bottom:1px solid #ddd;text-align:center;'>%2</td>"
+            "<td style='padding:6px 8px;border-bottom:1px solid #ddd;text-align:right;'>LE %3</td>"
+            "<td style='padding:6px 8px;border-bottom:1px solid #ddd;text-align:center;'>%4</td>"
+            "<td style='padding:6px 8px;border-bottom:1px solid #ddd;text-align:right;'>LE %5</td>"
+            "</tr>"
+        ).arg(name).arg(qty)
+            .arg(price, 0, 'f', 2).arg(disc)
+            .arg(total, 0, 'f', 2);
     }
 
-    searchResultsTable->setRowCount(results.size());
+    // 4. Build full HTML receipt
+    QString html = QString(
+        "<html>"
+        "<body style='font-family:Arial,sans-serif; font-size:11pt; margin:0; padding:0;'>"
+        "<h2 style='text-align:center; font-size:16pt; letter-spacing:3px; margin-bottom:4pt; margin-top:0; direction:rtl;'>مكتبه الشيخ</h2>"
+        "<hr style='border:1px solid #333;'/>"
+        "<table width='100%' cellspacing='0' cellpadding='3' style='font-size:10pt;'>"
+        "  <tr><td><b>Sale #:</b> %1</td><td align='right'><b>Date:</b> %2</td></tr>"
+        "  <tr><td colspan='2'><b>Cashier:</b> %3</td></tr>"
+        "</table>"
+        "<hr style='border:0.5px solid #aaa;'/>"
+        "<table width='100%' cellspacing='0' cellpadding='0' style='border-collapse:collapse; font-size:10pt;'>"
+        "  <thead>"
+        "    <tr style='background-color:#f0f0f0;'>"
+        "      <th style='padding:6px 8px; text-align:left;   border-bottom:2px solid #555;'>Item</th>"
+        "      <th style='padding:6px 8px; text-align:center; border-bottom:2px solid #555;'>Qty</th>"
+        "      <th style='padding:6px 8px; text-align:right;  border-bottom:2px solid #555;'>Unit Price</th>"
+        "      <th style='padding:6px 8px; text-align:center; border-bottom:2px solid #555;'>Discount</th>"
+        "      <th style='padding:6px 8px; text-align:right;  border-bottom:2px solid #555;'>Total</th>"
+        "    </tr>"
+        "  </thead>"
+        "  <tbody>%4</tbody>"
+        "</table>"
+        "<hr style='border:1px solid #333; margin-top:8pt;'/>"
+        "<table width='100%' cellspacing='0' cellpadding='4'>"
+        "  <tr><td align='right' style='font-size:13pt; font-weight:bold;'>TOTAL: LE %5</td></tr>"
+        "</table>"
+        "<br/>"
+        "<p style='text-align:center; font-size:9pt; color:#777;'>Thank you for your purchase!</p>"
+        "</body></html>"
+    )
+        .arg(saleNumber)
+        .arg(saleDate.toHtmlEscaped())
+        .arg(username.toHtmlEscaped())
+        .arg(itemRows)
+        .arg(totalAmount, 0, 'f', 2);
 
-    int row = 0;
-    for (const auto& item : results) {
-        double totalSellValue = item.quantity * item.price;
-        // double totalBoughtValue = item.quantity * item.boughtPrice; // Not displayed in this table
+    // 5. Setup printer
+    QPrinter printer(QPrinter::ScreenResolution);
+    printer.setPageSize(QPageSize(QPageSize::A4));
+    printer.setPageOrientation(QPageLayout::Portrait);
+    printer.setPageMargins(QMarginsF(15, 15, 15, 15), QPageLayout::Millimeter);
 
-        searchResultsTable->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(item.id)));
-        searchResultsTable->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(item.name)));
-        searchResultsTable->setItem(row, 2, new QTableWidgetItem(QString::number(item.quantity)));
-        searchResultsTable->setItem(row, 3, new QTableWidgetItem(QString("LE%1").arg(item.price, 0, 'f', 2)));
-        searchResultsTable->setItem(row, 4, new QTableWidgetItem(QString("LE%1").arg(item.boughtPrice, 0, 'f', 2)));
-        searchResultsTable->setItem(row, 5, new QTableWidgetItem(QString("LE%1").arg(totalSellValue, 0, 'f', 2)));
-
-        row++;
+    QPrintDialog printDialog(&printer, this);
+    printDialog.setWindowTitle("Print Receipt");
+    if (printDialog.exec() == QDialog::Rejected) {
+        return;
     }
 
-    if (results.empty() && !query.isEmpty()) {
-        QMessageBox::information(this, "Search Results", "No matching items found for your search query.");
-    }
-    // Hide suggestions when a full search is triggered
-    searchSuggestionsList->hide();
-    searchSuggestionsList->clear();
+    // 6. Render HTML via QTextDocument
+    QTextDocument doc;
+    doc.setHtml(html);
+    QSizeF pageSize = printer.pageLayout().paintRect(QPageLayout::Point).size();
+    doc.setPageSize(pageSize);
+    doc.print(&printer);
 }
 
 // New: Slot for handling text changes in the search input
@@ -2565,7 +2818,7 @@ void MainWindow::showInventoryManagement() {
         "Enter admin password:", QLineEdit::Password,
         "", &ok);
 
-    if (ok && !password.isEmpty() && password == "25254amm") {
+    if (ok && !password.isEmpty() && password == "25254") {
         QDialog* dialog = new QDialog(this);
         dialog->setWindowTitle("Inventory Management");
         dialog->setMinimumSize(800, 600);
@@ -2605,12 +2858,10 @@ void MainWindow::showInventoryManagement() {
         idLayout->addWidget(itemIdInput);
 
         // NEW: Auto-tabbing for itemIdInput in Inventory Management
-        connect(itemIdInput, &QLineEdit::textChanged, this, [=](const QString& text) {
-            if (text.isEmpty()) return;
-            // For simplicity, just move to item name upon any text entry.
-            // A more sophisticated check might be 'if (inventory.getInventory().count(text.toStdString()))'
-            // and then decide whether to move to quantity or item name based on 'new item' vs 'existing item' flow.
-            itemNameInput->setFocus(); // Move focus to item name input
+        connect(itemIdInput, &QLineEdit::returnPressed, this, [=]() {
+            if (!itemIdInput->text().isEmpty()) {
+                itemNameInput->setFocus(); // Move to name only when Enter is pressed (or scan completes)
+            }
             });
 
         QVBoxLayout* nameLayout = new QVBoxLayout();
@@ -2654,18 +2905,32 @@ void MainWindow::showInventoryManagement() {
         boughtPriceLayout->addWidget(boughtPriceLabel);
         boughtPriceLayout->addWidget(boughtPriceInput);
 
+        // New: Low-stock Threshold Input
+        QVBoxLayout* thresholdLayout = new QVBoxLayout();
+        thresholdLayout->setSpacing(5);
+        QLabel* thresholdLabel = new QLabel("Low-Stock Threshold");
+        thresholdLabel->setObjectName("fieldLabel");
+        itemThresholdInput = new QLineEdit();
+        itemThresholdInput->setObjectName("styledInput");
+        itemThresholdInput->setPlaceholderText("e.g., 5  (alert when qty < this)");
+        itemThresholdInput->setValidator(new QIntValidator(0, 99999, dialog));
+        thresholdLayout->addWidget(thresholdLabel);
+        thresholdLayout->addWidget(itemThresholdInput);
 
         fieldsLayout->addLayout(idLayout);
         fieldsLayout->addLayout(nameLayout);
         fieldsLayout->addLayout(quantityLayout);
         fieldsLayout->addLayout(priceLayout);
         fieldsLayout->addLayout(boughtPriceLayout);
+        fieldsLayout->addLayout(thresholdLayout);
 
         addItemButton = new QPushButton("Add Item to Inventory");
         addItemButton->setObjectName("primaryButton");
         addItemButton->setMinimumHeight(45);
+        addItemButton->setDefault(false);
+        addItemButton->setAutoDefault(false);
         addItemButton->setCursor(Qt::PointingHandCursor);
-        addItemButton->setDefault(true); // Set as default for this dialog
+        //addItemButton->setDefault(true); // Set as default for this dialog
 
         formLayout->addWidget(formTitle);
         formLayout->addLayout(fieldsLayout);
@@ -2685,37 +2950,94 @@ void MainWindow::showInventoryManagement() {
 
         QTableWidget* inventoryTableDialog = new QTableWidget();
         inventoryTableDialog->setObjectName("styledTable");
-        inventoryTableDialog->setColumnCount(6);
-        inventoryTableDialog->setHorizontalHeaderLabels({ "Item ID", "Item Name", "Quantity", "Sell Price", "Bought Price", "Total Sell Value" });
+        inventoryTableDialog->setColumnCount(7);
+        inventoryTableDialog->setHorizontalHeaderLabels({ "Item ID", "Item Name", "Quantity", "Sell Price", "Bought Price", "Total Sell Value", "Threshold" });
         inventoryTableDialog->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
         inventoryTableDialog->setAlternatingRowColors(true);
         inventoryTableDialog->setSelectionBehavior(QAbstractItemView::SelectRows);
         inventoryTableDialog->verticalHeader()->setVisible(false);
 
-        // Populate the table
-        auto refreshInventoryTable = [=]() {
-            const auto& inv = inventory.getInventory(); // Get current inventory from DB
-            inventoryTableDialog->setRowCount(inv.size());
+        // Populate the table (optionally filtered by search term)
+        auto refreshInventoryTable = [=](const QString& filterText = "") {
+            const auto& inv = inventory.getInventory();
+            QString lower = filterText.trimmed().toLower();
 
+            inventoryTableDialog->setRowCount(0);
             int row = 0;
             for (const auto& pair : inv) {
                 const Item& item = pair.second;
-                double totalSellValue = item.quantity * item.price;
+                QString itemId = QString::fromStdString(item.id);
+                QString itemName = QString::fromStdString(item.name);
 
-                inventoryTableDialog->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(item.id)));
-                inventoryTableDialog->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(item.name)));
+                // Filter: show all when empty, otherwise match ID or name
+                if (!lower.isEmpty() &&
+                    !itemId.toLower().contains(lower) &&
+                    !itemName.toLower().contains(lower)) {
+                    continue;
+                }
+
+                double totalSellValue = item.quantity * item.price;
+                inventoryTableDialog->insertRow(row);
+                inventoryTableDialog->setItem(row, 0, new QTableWidgetItem(itemId));
+                inventoryTableDialog->setItem(row, 1, new QTableWidgetItem(itemName));
                 inventoryTableDialog->setItem(row, 2, new QTableWidgetItem(QString::number(item.quantity)));
                 inventoryTableDialog->setItem(row, 3, new QTableWidgetItem(QString("LE%1").arg(item.price, 0, 'f', 2)));
                 inventoryTableDialog->setItem(row, 4, new QTableWidgetItem(QString("LE%1").arg(item.boughtPrice, 0, 'f', 2)));
                 inventoryTableDialog->setItem(row, 5, new QTableWidgetItem(QString("LE%1").arg(totalSellValue, 0, 'f', 2)));
+                inventoryTableDialog->setItem(row, 6, new QTableWidgetItem(QString::number(item.threshold)));
+
+                // Highlight low-stock rows
+                if (item.quantity < item.threshold) {
+                    for (int col = 0; col < 7; ++col) {
+                        if (inventoryTableDialog->item(row, col)) {
+                            inventoryTableDialog->item(row, col)->setBackground(QColor(255, 240, 240));
+                            inventoryTableDialog->item(row, col)->setForeground(Qt::darkRed);
+                        }
+                    }
+                }
                 row++;
             }
             };
 
-        // Initial table population
+        // ── Search bar above the table ────────────────────────────────────────
+        QHBoxLayout* searchBarLayout = new QHBoxLayout();
+        searchBarLayout->setSpacing(8);
+
+        QLineEdit* invSearchInput = new QLineEdit();
+        invSearchInput->setObjectName("styledInput");
+        invSearchInput->setPlaceholderText("🔍  Search by item ID or name...");
+        invSearchInput->setMinimumHeight(38);
+        invSearchInput->setClearButtonEnabled(true);
+
+        QPushButton* invSearchClearBtn = new QPushButton("✕  Clear");
+        invSearchClearBtn->setObjectName("secondaryButton");
+        invSearchClearBtn->setMinimumHeight(38);
+        invSearchClearBtn->setMinimumWidth(80);
+        invSearchClearBtn->setAutoDefault(false);
+        invSearchClearBtn->setCursor(Qt::PointingHandCursor);
+
+        searchBarLayout->addWidget(invSearchInput, 1);
+        searchBarLayout->addWidget(invSearchClearBtn);
+
+        // Live filtering as user types
+        connect(invSearchInput, &QLineEdit::textChanged, this,
+            [=](const QString& text) {
+                refreshInventoryTable(text);
+            });
+
+        // Clear button resets search and reloads full list
+        connect(invSearchClearBtn, &QPushButton::clicked, this,
+            [=]() {
+                invSearchInput->clear();
+                refreshInventoryTable();
+                invSearchInput->setFocus();
+            });
+
+        // Initial table population (full list)
         refreshInventoryTable();
 
         tableLayout->addWidget(tableTitle);
+        tableLayout->addLayout(searchBarLayout);
         tableLayout->addWidget(inventoryTableDialog);
 
         // New: Buttons for total sell and bought money
@@ -2727,15 +3049,84 @@ void MainWindow::showInventoryManagement() {
         showTotalSellMoneyButton->setObjectName("secondaryButton");
         showTotalSellMoneyButton->setMinimumHeight(40);
         showTotalSellMoneyButton->setCursor(Qt::PointingHandCursor);
+        showTotalSellMoneyButton->setAutoDefault(false); // Prevent Enter key activation
 
         QPushButton* showTotalBoughtMoneyButton = new QPushButton("Show Total Bought Money");
         showTotalBoughtMoneyButton->setObjectName("secondaryButton");
         showTotalBoughtMoneyButton->setMinimumHeight(40);
         showTotalBoughtMoneyButton->setCursor(Qt::PointingHandCursor);
+        showTotalBoughtMoneyButton->setAutoDefault(false); // Prevent Enter key activation
 
         totalsLayout->addWidget(showTotalSellMoneyButton);
         totalsLayout->addWidget(showTotalBoughtMoneyButton);
         tableLayout->addLayout(totalsLayout);
+
+        // ── Edit / Delete buttons ─────────────────────────────────────────────
+        QHBoxLayout* editDeleteLayout = new QHBoxLayout();
+        editDeleteLayout->setSpacing(10);
+
+        QPushButton* editItemButton = new QPushButton("✏️  Edit Selected Item");
+        editItemButton->setObjectName("primaryButton");
+        editItemButton->setMinimumHeight(40);
+        editItemButton->setCursor(Qt::PointingHandCursor);
+        editItemButton->setAutoDefault(false);
+
+        QPushButton* deleteItemButton = new QPushButton("🗑️  Delete Selected Item");
+        deleteItemButton->setObjectName("dangerButton");
+        deleteItemButton->setMinimumHeight(40);
+        deleteItemButton->setCursor(Qt::PointingHandCursor);
+        deleteItemButton->setAutoDefault(false);
+
+        editDeleteLayout->addStretch();
+        editDeleteLayout->addWidget(editItemButton);
+        editDeleteLayout->addWidget(deleteItemButton);
+        tableLayout->addLayout(editDeleteLayout);
+
+        // Right-click context menu on the table
+        inventoryTableDialog->setContextMenuPolicy(Qt::CustomContextMenu);
+        connect(inventoryTableDialog, &QTableWidget::customContextMenuRequested, this,
+            [=](const QPoint& pos) {
+                QTableWidgetItem* clickedCell = inventoryTableDialog->itemAt(pos);
+                if (!clickedCell) return;
+                int row = clickedCell->row();
+                QString itemId = inventoryTableDialog->item(row, 0)->text();
+
+                QMenu contextMenu(inventoryTableDialog);
+                QAction* editAction = contextMenu.addAction("✏️  Edit Item");
+                QAction* deleteAction = contextMenu.addAction("🗑️  Delete Item");
+                QAction* chosen = contextMenu.exec(inventoryTableDialog->viewport()->mapToGlobal(pos));
+                if (chosen == editAction)
+                    editInventoryItem(itemId, inventoryTableDialog,
+                        [=]() { refreshInventoryTable(invSearchInput->text()); });
+                else if (chosen == deleteAction)
+                    deleteInventoryItem(itemId, inventoryTableDialog,
+                        [=]() { refreshInventoryTable(invSearchInput->text()); });
+            });
+
+        // Connect Edit button
+        connect(editItemButton, &QPushButton::clicked, this, [=]() {
+            int row = inventoryTableDialog->currentRow();
+            if (row < 0) {
+                QMessageBox::warning(dialog, "No Selection", "Please select an item row to edit.");
+                return;
+            }
+            QString itemId = inventoryTableDialog->item(row, 0)->text();
+            editInventoryItem(itemId, inventoryTableDialog,
+                [=]() { refreshInventoryTable(invSearchInput->text()); });
+            });
+
+        // Connect Delete button
+        connect(deleteItemButton, &QPushButton::clicked, this, [=]() {
+            int row = inventoryTableDialog->currentRow();
+            if (row < 0) {
+                QMessageBox::warning(dialog, "No Selection", "Please select an item row to delete.");
+                return;
+            }
+            QString itemId = inventoryTableDialog->item(row, 0)->text();
+            deleteInventoryItem(itemId, inventoryTableDialog,
+                [=]() { refreshInventoryTable(invSearchInput->text()); });
+            });
+        // ─────────────────────────────────────────────────────────────────────
 
         // Connect the Add Item button
         connect(addItemButton, &QPushButton::clicked, this, [=, &dialog]() {
@@ -2769,10 +3160,191 @@ void MainWindow::showInventoryManagement() {
                 return;
             }
 
-            inventory.addItem(id.toStdString(), name.toStdString(), quantity, price, boughtPrice);
+            // -- Duplicate barcode check ------------------------------------------
+            QSqlQuery checkQuery;
+            checkQuery.prepare("SELECT item_name, quantity, price, bought_price "
+                "FROM items WHERE item_id = :item_id");
+            checkQuery.bindValue(":item_id", id);
+
+            if (checkQuery.exec() && checkQuery.next()) {
+                QString existingName = checkQuery.value("item_name").toString();
+                int     existingQty = checkQuery.value("quantity").toInt();
+                double  existingPrice = checkQuery.value("price").toDouble();
+                double  existingBought = checkQuery.value("bought_price").toDouble();
+
+                // ── Styled duplicate-barcode dialog ──────────────────────────
+                QDialog dupDialog(dialog);
+                dupDialog.setWindowTitle("Barcode Already Exists");
+                dupDialog.setFixedWidth(460);
+                dupDialog.setStyleSheet(R"(
+                    QDialog {
+                        background-color: #f8f9fa;
+                        font-family: 'Segoe UI', Arial, sans-serif;
+                    }
+                    QLabel#dupTitle {
+                        font-size: 17px;
+                        font-weight: bold;
+                        color: white;
+                    }
+                    QLabel#dupBody {
+                        font-size: 13px;
+                        color: #2c3e50;
+                        background: white;
+                        border-radius: 10px;
+                        padding: 16px;
+                        border: 1px solid #e9ecef;
+                    }
+                    QPushButton#editBtn {
+                        background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                            stop:0 #007bff, stop:1 #0056b3);
+                        color: white; border: none; border-radius: 8px;
+                        font-size: 13px; font-weight: 600;
+                        padding: 10px 20px; min-height: 38px;
+                    }
+                    QPushButton#editBtn:hover {
+                        background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                            stop:0 #0056b3, stop:1 #004085);
+                    }
+                    QPushButton#deleteBtn {
+                        background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                            stop:0 #dc3545, stop:1 #c82333);
+                        color: white; border: none; border-radius: 8px;
+                        font-size: 13px; font-weight: 600;
+                        padding: 10px 20px; min-height: 38px;
+                    }
+                    QPushButton#deleteBtn:hover {
+                        background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                            stop:0 #c82333, stop:1 #bd2130);
+                    }
+                    QPushButton#cancelBtn {
+                        background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                            stop:0 #6c757d, stop:1 #545b62);
+                        color: white; border: none; border-radius: 8px;
+                        font-size: 13px; font-weight: 600;
+                        padding: 10px 20px; min-height: 38px;
+                    }
+                    QPushButton#cancelBtn:hover {
+                        background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                            stop:0 #545b62, stop:1 #3d4142);
+                    }
+                )");
+
+                QVBoxLayout* dupLayout = new QVBoxLayout(&dupDialog);
+                dupLayout->setContentsMargins(0, 0, 0, 20);
+                dupLayout->setSpacing(0);
+
+                // Gradient header banner
+                QFrame* headerBanner = new QFrame();
+                headerBanner->setFixedHeight(72);
+                headerBanner->setStyleSheet(
+                    "background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+                    "stop:0 #667eea, stop:1 #764ba2);"
+                    "border-top-left-radius: 4px; border-top-right-radius: 4px;"
+                );
+                QHBoxLayout* bannerLayout = new QHBoxLayout(headerBanner);
+                bannerLayout->setContentsMargins(20, 0, 20, 0);
+
+                QLabel* warnIcon = new QLabel("⚠");
+                warnIcon->setStyleSheet("font-size: 28px; color: #ffe066; background: transparent;");
+
+                QLabel* dupTitle = new QLabel("Barcode Already Exists");
+                dupTitle->setObjectName("dupTitle");
+                dupTitle->setStyleSheet("font-size: 17px; font-weight: bold; color: white; background: transparent;");
+
+                bannerLayout->addWidget(warnIcon);
+                bannerLayout->addSpacing(10);
+                bannerLayout->addWidget(dupTitle);
+                bannerLayout->addStretch();
+                dupLayout->addWidget(headerBanner);
+
+                // Info card
+                dupLayout->addSpacing(16);
+                QLabel* dupBody = new QLabel(
+                    QString(
+                        "<b style='color:#667eea;'>Barcode: %1</b><br><br>"
+                        "<table cellspacing='6'>"
+                        "<tr><td style='color:#6c757d;'>📦 &nbsp;Name</td>"
+                        "    <td><b>%2</b></td></tr>"
+                        "<tr><td style='color:#6c757d;'>🔢 &nbsp;Quantity</td>"
+                        "    <td><b>%3</b></td></tr>"
+                        "<tr><td style='color:#6c757d;'>💰 &nbsp;Sell Price</td>"
+                        "    <td><b>LE %4</b></td></tr>"
+                        "<tr><td style='color:#6c757d;'>🛒 &nbsp;Bought Price</td>"
+                        "    <td><b>LE %5</b></td></tr>"
+                        "</table><br>"
+                        "<span style='color:#6c757d; font-size:12px;'>"
+                        "Please choose an action below, or cancel to re-enter a different barcode.</span>"
+                    )
+                    .arg(id).arg(existingName).arg(existingQty)
+                    .arg(existingPrice, 0, 'f', 2)
+                    .arg(existingBought, 0, 'f', 2)
+                );
+                dupBody->setObjectName("dupBody");
+                dupBody->setTextFormat(Qt::RichText);
+                dupBody->setWordWrap(true);
+                dupBody->setContentsMargins(20, 0, 20, 0);
+                dupBody->setStyleSheet(
+                    "font-size: 13px; color: #2c3e50;"
+                    "background: white; border-radius: 10px;"
+                    "padding: 16px; border: 1px solid #e9ecef;"
+                    "margin-left: 16px; margin-right: 16px;"
+                );
+                dupLayout->addWidget(dupBody);
+
+                // Buttons row
+                dupLayout->addSpacing(16);
+                QHBoxLayout* btnRow = new QHBoxLayout();
+                btnRow->setContentsMargins(16, 0, 16, 0);
+                btnRow->setSpacing(10);
+
+                QPushButton* editBtn = new QPushButton("✏️  Edit Existing");
+                editBtn->setObjectName("editBtn");
+                QPushButton* deleteBtn = new QPushButton("🗑️  Delete Existing");
+                deleteBtn->setObjectName("deleteBtn");
+                QPushButton* cancelDupBtn = new QPushButton("Cancel");
+                cancelDupBtn->setObjectName("cancelBtn");
+
+                btnRow->addWidget(editBtn);
+                btnRow->addWidget(deleteBtn);
+                btnRow->addStretch();
+                btnRow->addWidget(cancelDupBtn);
+                dupLayout->addLayout(btnRow);
+
+                // Wire buttons
+                int dupResult = 0; // 0=cancel, 1=edit, 2=delete
+                connect(editBtn, &QPushButton::clicked, [&]() { dupResult = 1; dupDialog.accept(); });
+                connect(deleteBtn, &QPushButton::clicked, [&]() { dupResult = 2; dupDialog.accept(); });
+                connect(cancelDupBtn, &QPushButton::clicked, [&]() { dupResult = 0; dupDialog.reject(); });
+
+                dupDialog.exec();
+
+                if (dupResult == 1) {
+                    editInventoryItem(id, inventoryTableDialog, refreshInventoryTable);
+                }
+                else if (dupResult == 2) {
+                    deleteInventoryItem(id, inventoryTableDialog, refreshInventoryTable);
+                }
+                // 0 = cancel: keep form filled so user can correct the barcode
+                return;
+            }
+            // -- No duplicate, safe to insert -------------------------------------
+
+            bool okThreshold = true;
+            int threshold = 5;
+            QString threshStr = itemThresholdInput->text().trimmed();
+            if (!threshStr.isEmpty()) {
+                threshold = threshStr.toInt(&okThreshold);
+                if (!okThreshold || threshold < 0) {
+                    QMessageBox::warning(dialog, "Error", "Threshold must be a non-negative integer.");
+                    return;
+                }
+            }
+
+            inventory.addItem(id.toStdString(), name.toStdString(), quantity, price, boughtPrice, threshold);
             clearInventoryForm();
+            invSearchInput->clear();          // clear search so new item is visible
             refreshInventoryTable();
-            refreshDeficienciesTable(); // Also refresh deficiencies if inventory changes
+            refreshDeficienciesTable();
             QMessageBox::information(dialog, "Success", "Item added successfully!");
             });
 
@@ -2783,7 +3355,7 @@ void MainWindow::showInventoryManagement() {
                 "Enter admin password to view total sell money:", QLineEdit::Password,
                 "", &authOk);
 
-            if (authOk && !adminPassword.isEmpty() && adminPassword == "25254amm") {
+            if (authOk && !adminPassword.isEmpty() && adminPassword == "25254") {
                 double totalSell = inventory.getTotalInventorySellValue();
                 QMessageBox::information(dialog, "Total Sell Money",
                     QString("Total potential sell value of all items in inventory: LE%1").arg(totalSell, 0, 'f', 2));
@@ -2800,7 +3372,7 @@ void MainWindow::showInventoryManagement() {
                 "Enter admin password to view total bought money:", QLineEdit::Password,
                 "", &authOk);
 
-            if (authOk && !adminPassword.isEmpty() && adminPassword == "25254amm") {
+            if (authOk && !adminPassword.isEmpty() && adminPassword == "25254") {
                 double totalBought = inventory.getTotalInventoryBoughtValue();
                 QMessageBox::information(dialog, "Total Bought Money",
                     QString("Total cost of all items in inventory: LE%1").arg(totalBought, 0, 'f', 2));
@@ -2817,6 +3389,7 @@ void MainWindow::showInventoryManagement() {
         closeButton->setMinimumHeight(40);
         closeButton->setMinimumWidth(100);
         closeButton->setCursor(Qt::PointingHandCursor);
+        closeButton->setAutoDefault(false); // Prevent Enter key activation
 
         // Assemble the layout
         contentLayout->addWidget(formFrame);
@@ -2840,6 +3413,33 @@ void MainWindow::showInventoryManagement() {
         tableFrame->setGraphicsEffect(tableShadowEffect);
 
         connect(closeButton, &QPushButton::clicked, dialog, &QDialog::accept);
+        // FIX: Connect Enter key to move focus to the next field
+        connect(itemIdInput, &QLineEdit::returnPressed, [=]() {
+            itemNameInput->setFocus();
+            itemNameInput->selectAll(); // Optional: selects text so you can overwrite if needed
+            });
+
+        connect(itemNameInput, &QLineEdit::returnPressed, [=]() {
+            itemQuantityInput->setFocus();
+            itemQuantityInput->selectAll();
+            });
+
+        connect(itemQuantityInput, &QLineEdit::returnPressed, [=]() {
+            itemPriceInput->setFocus();
+            itemPriceInput->selectAll();
+            });
+
+        connect(itemPriceInput, &QLineEdit::returnPressed, [=]() {
+            boughtPriceInput->setFocus();
+            boughtPriceInput->selectAll();
+            });
+
+        connect(boughtPriceInput, &QLineEdit::returnPressed, [=]() {
+            itemThresholdInput->setFocus();
+            itemThresholdInput->selectAll();
+            });
+        // Hitting Enter on the LAST field triggers the Add button
+        connect(itemThresholdInput, &QLineEdit::returnPressed, addItemButton, &QPushButton::click);
 
         dialog->exec();
         delete dialog;
@@ -2882,16 +3482,20 @@ void MainWindow::setupReturnsTab() {
     itemIdLayout->addWidget(itemIdLabel);
     itemIdLayout->addWidget(returnItemIdInput);
 
-    // NEW: Auto-tabbing for returnItemIdInput
-    connect(returnItemIdInput, &QLineEdit::textChanged, this, [this](const QString& text) {
+    // Move focus to quantity only when Enter is pressed
+    connect(returnItemIdInput, &QLineEdit::returnPressed, this, [this]() {
+        QString text = returnItemIdInput->text().trimmed();
         if (text.isEmpty()) return;
-        // Check if the entered text is a valid item ID in the inventory
-        // Now checks database
         QSqlQuery query;
         query.prepare("SELECT COUNT(*) FROM items WHERE item_id = :item_id");
         query.bindValue(":item_id", text);
         if (query.exec() && query.next() && query.value(0).toInt() > 0) {
-            returnQuantityInput->setFocus(); // Move focus to quantity input
+            returnQuantityInput->setFocus();
+        }
+        else {
+            QMessageBox::warning(this, "Item Not Found",
+                QString("Item ID '%1' was not found in inventory.").arg(text));
+            returnItemIdInput->selectAll();
         }
         });
 
@@ -2905,16 +3509,25 @@ void MainWindow::setupReturnsTab() {
     quantityLayout->addWidget(quantityLabel);
     quantityLayout->addWidget(returnQuantityInput);
 
+    // Enter on quantity moves to reason field
+    connect(returnQuantityInput, &QLineEdit::returnPressed, this, [this]() {
+        returnReasonInput->setFocus();
+        });
+
     QVBoxLayout* reasonLayout = new QVBoxLayout();
     reasonLayout->setSpacing(5);
-    QLabel* reasonLabel = new QLabel("Reason for Return");
+    QLabel* reasonLabel = new QLabel("Reason for Return (optional)");
     reasonLabel->setObjectName("fieldLabel");
     returnReasonInput = new QTextEdit();
     returnReasonInput->setObjectName("styledInput");
-    returnReasonInput->setPlaceholderText("e.g., Damaged item, wrong size");
+    returnReasonInput->setPlaceholderText("e.g., Damaged item, wrong size (press Enter to submit)");
     returnReasonInput->setMinimumHeight(60);
+    returnReasonInput->setMaximumHeight(60);
     reasonLayout->addWidget(reasonLabel);
     reasonLayout->addWidget(returnReasonInput);
+
+    // Install event filter so Enter key in reason field triggers Process Return
+    returnReasonInput->installEventFilter(this);
 
 
     fieldsLayout->addLayout(itemIdLayout);
@@ -2968,6 +3581,18 @@ void MainWindow::setupReturnsTab() {
 }
 
 // NEW: Process Return Item
+bool MainWindow::eventFilter(QObject* obj, QEvent* event) {
+    if (obj == returnReasonInput && event->type() == QEvent::KeyPress) {
+        QKeyEvent* keyEvent = static_cast<QKeyEvent*>(event);
+        if (keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter) {
+            // Enter in reason field submits the return
+            processReturnItem();
+            return true; // Consume the event (don't insert newline)
+        }
+    }
+    return QMainWindow::eventFilter(obj, event);
+}
+
 void MainWindow::processReturnItem() {
     QString itemId = returnItemIdInput->text().trimmed();
     QString quantityStr = returnQuantityInput->text().trimmed();
@@ -2976,8 +3601,8 @@ void MainWindow::processReturnItem() {
     bool quantityOk;
     int quantity = quantityStr.toInt(&quantityOk);
 
-    if (itemId.isEmpty() || !quantityOk || quantity <= 0 || reason.isEmpty()) {
-        QMessageBox::warning(this, "Input Error", "Please enter a valid Item ID, a positive numeric quantity, and a reason for return.");
+    if (itemId.isEmpty() || !quantityOk || quantity <= 0) {
+        QMessageBox::warning(this, "Input Error", "Please enter a valid Item ID and a positive numeric quantity.");
         return;
     }
 
@@ -3085,27 +3710,776 @@ void MainWindow::refreshIndebtednessForCustomer(const std::string& customer) {
 }
 
 void MainWindow::refreshDeficienciesTable() {
-    if (!deficienciesTable) return; // Add check for initialization
+    if (!deficienciesTable) return;
 
-    deficienciesTable->setRowCount(0); // Clear existing rows
+    // Ensure 4 columns (upgrade from old 3-column layout)
+    if (deficienciesTable->columnCount() < 4) {
+        deficienciesTable->setColumnCount(4);
+        deficienciesTable->setHorizontalHeaderLabels({ "Item ID", "Item Name", "Current Qty", "Threshold" });
+    }
 
-    const auto& inventoryItems = inventory.getInventory(); // Get the current inventory from DB
-    int row = 0; //
+    deficienciesTable->setRowCount(0);
 
-    for (const auto& pair : inventoryItems) { //
-        const Item& item = pair.second; //
-        if (item.quantity <= 7) { // Check if quantity is 7 or less
-            deficienciesTable->insertRow(row); //
-            deficienciesTable->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(item.id))); //
-            deficienciesTable->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(item.name))); //
-            deficienciesTable->setItem(row, 2, new QTableWidgetItem(QString::number(item.quantity))); //
+    const auto& lowItems = inventory.getItemsBelowThreshold();
+    int row = 0;
+    for (const auto& item : lowItems) {
+        deficienciesTable->insertRow(row);
+        deficienciesTable->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(item.id)));
+        deficienciesTable->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(item.name)));
+        deficienciesTable->setItem(row, 2, new QTableWidgetItem(QString::number(item.quantity)));
+        deficienciesTable->setItem(row, 3, new QTableWidgetItem(QString::number(item.threshold)));
 
-            // Optionally, highlight these rows to draw attention
-            for (int col = 0; col < deficienciesTable->columnCount(); ++col) { //
-                deficienciesTable->item(row, col)->setBackground(QColor(255, 240, 240)); // Light red background
-                deficienciesTable->item(row, col)->setForeground(Qt::darkRed); // Dark red text
-            }
-            row++; //
+        for (int col = 0; col < 4; ++col) {
+            deficienciesTable->item(row, col)->setBackground(QColor(255, 240, 240));
+            deficienciesTable->item(row, col)->setForeground(Qt::darkRed);
+        }
+        row++;
+    }
+}
+void MainWindow::searchItem() {
+    QString query = searchInput->text().trimmed(); // Trim whitespace
+    const auto& inv = inventory.getInventory(); // Get current inventory from DB
+
+    searchResultsTable->setRowCount(0); // Clear previous results
+    std::vector<Item> results;
+
+    for (const auto& pair : inv) {
+        const Item& item = pair.second;
+        if (query.isEmpty() || QString::fromStdString(item.id).contains(query, Qt::CaseInsensitive) ||
+            QString::fromStdString(item.name).contains(query, Qt::CaseInsensitive)) {
+            results.push_back(item);
         }
     }
+
+    searchResultsTable->setRowCount(results.size());
+
+    int row = 0;
+    for (const auto& item : results) {
+        double totalSellValue = item.quantity * item.price;
+
+        searchResultsTable->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(item.id)));
+        searchResultsTable->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(item.name)));
+        searchResultsTable->setItem(row, 2, new QTableWidgetItem(QString::number(item.quantity)));
+        searchResultsTable->setItem(row, 3, new QTableWidgetItem(QString("LE%1").arg(item.price, 0, 'f', 2)));
+        searchResultsTable->setItem(row, 4, new QTableWidgetItem(QString("LE%1").arg(item.boughtPrice, 0, 'f', 2)));
+        searchResultsTable->setItem(row, 5, new QTableWidgetItem(QString("LE%1").arg(totalSellValue, 0, 'f', 2)));
+
+        row++;
+    }
+
+    if (results.empty() && !query.isEmpty()) {
+        QMessageBox::information(this, "Search Results", "No matching items found for your search query.");
+    }
+
+    // Hide suggestions when a full search is triggered
+    searchSuggestionsList->hide();
+    searchSuggestionsList->clear();
+}
+
+// ── Edit Inventory Item ───────────────────────────────────────────────────────
+void MainWindow::editInventoryItem(const QString& itemId,
+    QTableWidget* inventoryTableDialog,
+    std::function<void()> refreshFn)
+{
+    // Look up the item from the inventory
+    const auto& inv = inventory.getInventory();
+    auto it = inv.find(itemId.toStdString());
+    if (it == inv.end()) {
+        QMessageBox::warning(this, "Not Found",
+            QString("Item '%1' was not found in the inventory.").arg(itemId));
+        return;
+    }
+    const Item& currentItem = it->second;
+
+    // Build an edit dialog pre-filled with current values
+    QDialog editDialog(this);
+    editDialog.setWindowTitle(QString("Edit Item — %1").arg(itemId));
+    editDialog.setMinimumWidth(380);
+    editDialog.setStyleSheet("QDialog { background-color: #f5f5f5; }");
+
+    QVBoxLayout* layout = new QVBoxLayout(&editDialog);
+    layout->setContentsMargins(24, 24, 24, 24);
+    layout->setSpacing(16);
+
+    QLabel* title = new QLabel(QString("Editing: <b>%1</b>").arg(itemId));
+    title->setObjectName("sectionTitle");
+    layout->addWidget(title);
+
+    QFormLayout* form = new QFormLayout();
+    form->setSpacing(12);
+
+    // Item Name
+    QLineEdit* nameEdit = new QLineEdit(QString::fromStdString(currentItem.name));
+    nameEdit->setObjectName("styledInput");
+    form->addRow("Item Name:", nameEdit);
+
+    // Quantity
+    QLineEdit* qtyEdit = new QLineEdit(QString::number(currentItem.quantity));
+    qtyEdit->setObjectName("styledInput");
+    qtyEdit->setValidator(new QIntValidator(0, 9999999, &editDialog));
+    form->addRow("Quantity:", qtyEdit);
+
+    // Sell Price
+    QLineEdit* priceEdit = new QLineEdit(QString::number(currentItem.price, 'f', 2));
+    priceEdit->setObjectName("styledInput");
+    priceEdit->setValidator(new QDoubleValidator(0.0, 9999999.99, 2, &editDialog));
+    form->addRow("Sell Price (LE):", priceEdit);
+
+    // Bought Price
+    QLineEdit* boughtEdit = new QLineEdit(QString::number(currentItem.boughtPrice, 'f', 2));
+    boughtEdit->setObjectName("styledInput");
+    boughtEdit->setValidator(new QDoubleValidator(0.0, 9999999.99, 2, &editDialog));
+    form->addRow("Bought Price (LE):", boughtEdit);
+
+    // Low-stock Threshold
+    QLineEdit* thresholdEdit = new QLineEdit(QString::number(currentItem.threshold));
+    thresholdEdit->setObjectName("styledInput");
+    thresholdEdit->setValidator(new QIntValidator(0, 99999, &editDialog));
+    form->addRow("Low-Stock Threshold:", thresholdEdit);
+
+    layout->addLayout(form);
+
+    // Buttons
+    QHBoxLayout* btnLayout = new QHBoxLayout();
+    QPushButton* saveBtn = new QPushButton("💾  Save Changes");
+    saveBtn->setObjectName("primaryButton");
+    saveBtn->setMinimumHeight(42);
+    saveBtn->setDefault(true);
+
+    QPushButton* cancelBtn = new QPushButton("Cancel");
+    cancelBtn->setObjectName("secondaryButton");
+    cancelBtn->setMinimumHeight(42);
+    cancelBtn->setAutoDefault(false);
+
+    btnLayout->addStretch();
+    btnLayout->addWidget(saveBtn);
+    btnLayout->addWidget(cancelBtn);
+    layout->addLayout(btnLayout);
+
+    connect(cancelBtn, &QPushButton::clicked, &editDialog, &QDialog::reject);
+
+    connect(saveBtn, &QPushButton::clicked, this, [&]() {
+        QString newName = nameEdit->text().trimmed();
+        QString qtyStr = qtyEdit->text().trimmed();
+        QString priceStr = priceEdit->text().trimmed();
+        QString boughtStr = boughtEdit->text().trimmed();
+
+        if (newName.isEmpty() || qtyStr.isEmpty() || priceStr.isEmpty() || boughtStr.isEmpty()) {
+            QMessageBox::warning(&editDialog, "Validation Error", "All fields are required.");
+            return;
+        }
+
+        bool okQ, okP, okB;
+        int    newQty = qtyStr.toInt(&okQ);
+        double newPrice = priceStr.toDouble(&okP);
+        double newBought = boughtStr.toDouble(&okB);
+        int    newThreshold = thresholdEdit->text().trimmed().isEmpty()
+            ? 5
+            : thresholdEdit->text().trimmed().toInt();
+
+        if (!okQ || newQty < 0) {
+            QMessageBox::warning(&editDialog, "Validation Error", "Quantity must be a non-negative integer.");
+            return;
+        }
+        if (!okP || newPrice <= 0) {
+            QMessageBox::warning(&editDialog, "Validation Error", "Sell price must be a positive number.");
+            return;
+        }
+        if (!okB || newBought < 0) {
+            QMessageBox::warning(&editDialog, "Validation Error", "Bought price must be a non-negative number.");
+            return;
+        }
+
+        // Persist changes via a direct SQL UPDATE
+        QSqlQuery q;
+        q.prepare(
+            "UPDATE items SET item_name = :item_name, quantity = :quantity, "
+            "price = :price, bought_price = :bought_price, threshold = :threshold "
+            "WHERE item_id = :item_id"
+        );
+        q.bindValue(":item_name", newName);
+        q.bindValue(":quantity", newQty);
+        q.bindValue(":price", newPrice);
+        q.bindValue(":bought_price", newBought);
+        q.bindValue(":threshold", newThreshold);
+        q.bindValue(":item_id", itemId);
+
+        if (!q.exec()) {
+            QMessageBox::critical(&editDialog, "Database Error",
+                "Failed to update item:\n" + q.lastError().text());
+            return;
+        }
+
+        refreshFn();               // refresh the dialog table
+        searchItem();              // refresh the main search tab
+        refreshDeficienciesTable();
+
+        refreshDeficienciesTable();
+        QMessageBox::information(&editDialog, "Saved",
+            QString("Item '%1' updated successfully.").arg(itemId));
+        editDialog.accept();
+        });
+
+    editDialog.exec();
+}
+
+// ── Delete Inventory Item ─────────────────────────────────────────────────────
+void MainWindow::deleteInventoryItem(const QString& itemId,
+    QTableWidget* inventoryTableDialog,
+    std::function<void()> refreshFn)
+{
+    // Confirm with the user before deleting
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this, "Confirm Delete",
+        QString("Are you sure you want to permanently delete item <b>%1</b> from the inventory?<br>"
+            "<br><i>This action cannot be undone.</i>").arg(itemId),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No   // default to No for safety
+    );
+
+    if (reply != QMessageBox::Yes)
+        return;
+
+    QSqlQuery q;
+    q.prepare("DELETE FROM items WHERE item_id = :id");
+    q.bindValue(":id", itemId);
+
+    if (!q.exec()) {
+        QMessageBox::critical(this, "Database Error",
+            "Failed to delete item:\n" + q.lastError().text());
+        return;
+    }
+
+    refreshFn();               // refresh the dialog table
+    searchItem();              // refresh the main search tab
+    refreshDeficienciesTable();
+
+    QMessageBox::information(this, "Deleted",
+        QString("Item '%1' has been removed from the inventory.").arg(itemId));
+}
+// ── Low-stock notification popup ─────────────────────────────────────────────
+void MainWindow::checkAndNotifyLowStock() {
+    // Show only once per login session (flag is reset in setCurrentUser)
+    if (lowStockNotifiedThisSession_) return;
+    lowStockNotifiedThisSession_ = true;
+
+    const auto& lowItems = inventory.getItemsBelowThreshold();
+    if (lowItems.empty()) {
+        lowStockNotifiedThisSession_ = false; // nothing shown, allow retry next call
+        return;
+    }
+
+    QDialog* alertDialog = new QDialog(this);
+    alertDialog->setWindowTitle("Low Stock Alert");
+    alertDialog->setFixedWidth(500);
+    alertDialog->setAttribute(Qt::WA_DeleteOnClose);
+    alertDialog->setStyleSheet(R"(
+        QDialog { background-color: #f8f9fa; font-family: 'Segoe UI', Arial, sans-serif; }
+        QLabel#alertBody {
+            font-size: 13px; color: #2c3e50;
+            background: white; border-radius: 10px;
+            padding: 14px; border: 1px solid #e9ecef;
+        }
+        QPushButton#okAlertBtn {
+            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                stop:0 #007bff, stop:1 #0056b3);
+            color: white; border: none; border-radius: 8px;
+            font-size: 13px; font-weight: 600;
+            padding: 10px 28px; min-height: 38px;
+        }
+        QPushButton#okAlertBtn:hover {
+            background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+                stop:0 #0056b3, stop:1 #004085);
+        }
+    )");
+
+    QVBoxLayout* layout = new QVBoxLayout(alertDialog);
+    layout->setContentsMargins(0, 0, 0, 20);
+    layout->setSpacing(0);
+
+    // Red gradient header banner
+    QFrame* banner = new QFrame();
+    banner->setFixedHeight(72);
+    banner->setStyleSheet(
+        "background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+        "stop:0 #e74c3c, stop:1 #c0392b);"
+        "border-top-left-radius: 4px; border-top-right-radius: 4px;"
+    );
+    QHBoxLayout* bannerLayout = new QHBoxLayout(banner);
+    bannerLayout->setContentsMargins(20, 0, 20, 0);
+
+    QLabel* warnIcon = new QLabel("⚠");
+    warnIcon->setStyleSheet("font-size: 28px; color: #ffe066; background: transparent;");
+
+    QLabel* bannerTitle = new QLabel(
+        QString("%1 Item(s) Below Their Threshold!").arg(lowItems.size())
+    );
+    bannerTitle->setStyleSheet(
+        "font-size: 16px; font-weight: bold; color: white; background: transparent;"
+    );
+
+    bannerLayout->addWidget(warnIcon);
+    bannerLayout->addSpacing(10);
+    bannerLayout->addWidget(bannerTitle);
+    bannerLayout->addStretch();
+    layout->addWidget(banner);
+
+    layout->addSpacing(14);
+
+    // Table of low-stock items
+    QTableWidget* alertTable = new QTableWidget((int)lowItems.size(), 4, alertDialog);
+    alertTable->setHorizontalHeaderLabels({ "Item ID", "Item Name", "Current Qty", "Threshold" });
+    alertTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    alertTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    alertTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    alertTable->verticalHeader()->setVisible(false);
+    alertTable->setAlternatingRowColors(true);
+    alertTable->setObjectName("styledTable");
+    alertTable->setMaximumHeight(220);
+
+    for (int i = 0; i < (int)lowItems.size(); ++i) {
+        const auto& item = lowItems[i];
+        alertTable->setItem(i, 0, new QTableWidgetItem(QString::fromStdString(item.id)));
+        alertTable->setItem(i, 1, new QTableWidgetItem(QString::fromStdString(item.name)));
+
+        QTableWidgetItem* qtyItem = new QTableWidgetItem(QString::number(item.quantity));
+        qtyItem->setForeground(QColor("#e74c3c"));
+        qtyItem->setFont(QFont("Segoe UI", 9, QFont::Bold));
+        alertTable->setItem(i, 2, qtyItem);
+
+        QTableWidgetItem* thrItem = new QTableWidgetItem(QString::number(item.threshold));
+        thrItem->setForeground(QColor("#6c757d"));
+        alertTable->setItem(i, 3, thrItem);
+    }
+
+    QFrame* tableWrap = new QFrame();
+    tableWrap->setContentsMargins(16, 0, 16, 0);
+    QVBoxLayout* wl = new QVBoxLayout(tableWrap);
+    wl->setContentsMargins(0, 0, 0, 0);
+    wl->addWidget(alertTable);
+    layout->addWidget(tableWrap);
+
+    layout->addSpacing(14);
+
+    // Footer hint
+    QLabel* hint = new QLabel(
+        "  Please restock these items to avoid running out of stock."
+    );
+    hint->setStyleSheet("font-size: 12px; color: #6c757d; margin-left: 16px;");
+    layout->addWidget(hint);
+
+    layout->addSpacing(10);
+
+    // OK button
+    QHBoxLayout* btnRow = new QHBoxLayout();
+    btnRow->setContentsMargins(16, 0, 16, 0);
+    QPushButton* okBtn = new QPushButton("OK, Got It");
+    okBtn->setObjectName("okAlertBtn");
+    okBtn->setMinimumHeight(40);
+    okBtn->setMinimumWidth(130);
+    okBtn->setCursor(Qt::PointingHandCursor);
+    connect(okBtn, &QPushButton::clicked, alertDialog, &QDialog::accept);
+    btnRow->addStretch();
+    btnRow->addWidget(okBtn);
+    layout->addLayout(btnRow);
+
+    alertDialog->exec();
+}
+
+// =============================================================================
+// Resolve database absolute path (DB may be opened with a relative path)
+// =============================================================================
+static QString resolveDbPath() {
+    QString dbPath = QSqlDatabase::database().databaseName();
+    if (dbPath.isEmpty()) return QString();
+    QFileInfo fi(dbPath);
+    if (fi.isRelative()) {
+        // Try app directory first, then current working directory
+        QFileInfo fi2(QCoreApplication::applicationDirPath() + "/" + dbPath);
+        if (fi2.exists()) return fi2.absoluteFilePath();
+        QFileInfo fi3(QDir::currentPath() + "/" + dbPath);
+        if (fi3.exists()) return fi3.absoluteFilePath();
+        return fi.absoluteFilePath(); // best guess
+    }
+    return fi.absoluteFilePath();
+}
+
+// =============================================================================
+// Automatic startup backup — runs before setupUI()
+// =============================================================================
+void MainWindow::performStartupBackup() {
+    lastBackupStatus_ = QString();
+    lastBackupOk_ = false;
+
+    QString dbPath = resolveDbPath();
+    if (dbPath.isEmpty() || !QFile::exists(dbPath)) {
+        lastBackupStatus_ = "Database file not found — backup skipped.\n"
+            "Path tried: " + QSqlDatabase::database().databaseName();
+        return;
+    }
+
+    QFileInfo dbInfo(dbPath);
+    QString backupDir = dbInfo.absolutePath() + "/backups";
+    if (!QDir().mkpath(backupDir)) {
+        lastBackupStatus_ = "Could not create backup folder:\n" + backupDir;
+        return;
+    }
+
+    // Keep only the last 30 daily backups
+    QDir bDir(backupDir);
+    QStringList old = bDir.entryList(QStringList() << "backup_*.db",
+        QDir::Files, QDir::Name);
+    while (old.size() >= 30) bDir.remove(old.takeFirst());
+
+    // One backup per calendar day
+    QString today = QDate::currentDate().toString("yyyy-MM-dd");
+    QString backupPath = backupDir + "/backup_" + today + ".db";
+
+    if (QFile::exists(backupPath)) {
+        lastBackupStatus_ = "Already backed up today (" + today + ").\nFile: " + backupPath;
+        lastBackupOk_ = true;
+        return;
+    }
+
+    if (QFile::copy(dbPath, backupPath)) {
+        lastBackupStatus_ = "Backup created successfully.\nFile: " + backupPath;
+        lastBackupOk_ = true;
+    }
+    else {
+        lastBackupStatus_ = "Copy failed — check folder permissions.\n"
+            "Source: " + dbPath + "\nTarget: " + backupPath;
+        lastBackupOk_ = false;
+    }
+}
+
+// =============================================================================
+// Show backup result after UI is ready (called via QTimer::singleShot)
+// =============================================================================
+void MainWindow::showBackupStartupResult() {
+    // Update the small status label in the header
+    if (backupStatusLabel_) {
+        if (lastBackupOk_) {
+            backupStatusLabel_->setText("Backup OK");
+            backupStatusLabel_->setStyleSheet(
+                "font-size:11px; color:white;"
+                "background-color:rgba(40,167,69,0.80);"
+                "border-radius:10px; padding:3px 10px;");
+        }
+        else {
+            backupStatusLabel_->setText("Backup FAILED");
+            backupStatusLabel_->setStyleSheet(
+                "font-size:11px; color:white;"
+                "background-color:rgba(220,53,69,0.90);"
+                "border-radius:10px; padding:3px 10px;");
+        }
+        backupStatusLabel_->setToolTip(lastBackupStatus_);
+    }
+
+    // Show a small non-intrusive result dialog
+    QDialog* toast = new QDialog(this);
+    toast->setWindowTitle("Startup Backup Status");
+    toast->setFixedWidth(430);
+    toast->setAttribute(Qt::WA_DeleteOnClose);
+
+    QString bannerColor = lastBackupOk_
+        ? "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #28a745,stop:1 #1e7e34);"
+        : "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #dc3545,stop:1 #c82333);";
+
+    toast->setStyleSheet(
+        "QDialog { background-color:#f8f9fa; font-family:'Segoe UI',Arial,sans-serif; }"
+        "QPushButton#toastOk {"
+        "  background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #007bff,stop:1 #0056b3);"
+        "  color:white; border:none; border-radius:8px;"
+        "  font-size:13px; font-weight:600; padding:8px 24px; min-height:34px; }"
+        "QPushButton#toastOk:hover { background:#0056b3; }"
+    );
+
+    QVBoxLayout* lay = new QVBoxLayout(toast);
+    lay->setContentsMargins(0, 0, 0, 14);
+    lay->setSpacing(0);
+
+    // Coloured banner
+    QFrame* banner = new QFrame();
+    banner->setFixedHeight(58);
+    banner->setStyleSheet(bannerColor +
+        "border-top-left-radius:4px; border-top-right-radius:4px;");
+    QHBoxLayout* bl = new QHBoxLayout(banner);
+    bl->setContentsMargins(16, 0, 16, 0);
+    QLabel* iconLbl = new QLabel(lastBackupOk_ ? "OK" : "FAIL");
+    iconLbl->setStyleSheet(
+        "font-size:15px; font-weight:bold; color:white; background:transparent;");
+    QLabel* titleLbl = new QLabel("Automatic Startup Backup");
+    titleLbl->setStyleSheet(
+        "font-size:14px; font-weight:bold; color:white; background:transparent;");
+    bl->addWidget(iconLbl);
+    bl->addSpacing(10);
+    bl->addWidget(titleLbl);
+    bl->addStretch();
+    lay->addWidget(banner);
+    lay->addSpacing(10);
+
+    // Detail message
+    QLabel* msg = new QLabel(lastBackupStatus_);
+    msg->setWordWrap(true);
+    msg->setStyleSheet(
+        "font-size:12px; color:#2c3e50; background:white;"
+        "border-radius:8px; padding:12px; border:1px solid #e9ecef;"
+        "margin-left:14px; margin-right:14px;");
+    lay->addWidget(msg);
+    lay->addSpacing(10);
+
+    // OK button + auto-close after 5 seconds
+    QHBoxLayout* btnRow = new QHBoxLayout();
+    btnRow->setContentsMargins(14, 0, 14, 0);
+    QPushButton* okBtn = new QPushButton("OK");
+    okBtn->setObjectName("toastOk");
+    okBtn->setMinimumHeight(34);
+    okBtn->setMinimumWidth(80);
+    okBtn->setCursor(Qt::PointingHandCursor);
+    connect(okBtn, &QPushButton::clicked, toast, &QDialog::accept);
+    btnRow->addStretch();
+    btnRow->addWidget(okBtn);
+    lay->addLayout(btnRow);
+
+    QTimer::singleShot(5000, toast, &QDialog::accept); // auto-close after 5s
+    toast->exec();
+
+    // If backup failed, show an urgent warning after the toast closes
+    if (!lastBackupOk_) {
+        QMessageBox::warning(this, "Auto-Backup Failed",
+            "The automatic backup could not be created.\n\n"
+            "Reason:\n" + lastBackupStatus_ + "\n\n"
+            "Please open the Backup Manager (the Backup button in the header)\n"
+            "and create a manual backup now.");
+    }
+}
+
+// =============================================================================
+// Backup Manager Dialog
+// =============================================================================
+void MainWindow::showBackupManager() {
+    QString dbPath = resolveDbPath();
+    if (dbPath.isEmpty()) dbPath = QSqlDatabase::database().databaseName();
+    QFileInfo dbInfo(dbPath);
+    QString backupDir = dbInfo.absolutePath() + "/backups";
+    QDir bDir(backupDir);
+
+    QDialog* dlg = new QDialog(this);
+    dlg->setWindowTitle("Database Backup Manager");
+    dlg->setMinimumWidth(600);
+    dlg->setMinimumHeight(440);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+
+    dlg->setStyleSheet(
+        "QDialog { background-color:#f8f9fa; font-family:'Segoe UI',Arial,sans-serif; }"
+        "QPushButton#backupNowBtn {"
+        "  background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #28a745,stop:1 #1e7e34);"
+        "  color:white; border:none; border-radius:8px;"
+        "  font-size:13px; font-weight:600; padding:10px 20px; min-height:38px; }"
+        "QPushButton#backupNowBtn:hover { background:#1e7e34; }"
+        "QPushButton#restoreBtn {"
+        "  background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #007bff,stop:1 #0056b3);"
+        "  color:white; border:none; border-radius:8px;"
+        "  font-size:13px; font-weight:600; padding:10px 20px; min-height:38px; }"
+        "QPushButton#restoreBtn:hover { background:#0056b3; }"
+        "QPushButton#deleteBackupBtn {"
+        "  background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #dc3545,stop:1 #c82333);"
+        "  color:white; border:none; border-radius:8px;"
+        "  font-size:13px; font-weight:600; padding:10px 20px; min-height:38px; }"
+        "QPushButton#deleteBackupBtn:hover { background:#c82333; }"
+        "QPushButton#closeBackupBtn {"
+        "  background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #6c757d,stop:1 #545b62);"
+        "  color:white; border:none; border-radius:8px;"
+        "  font-size:13px; font-weight:600; padding:10px 20px; min-height:38px; }"
+        "QPushButton#closeBackupBtn:hover { background:#545b62; }"
+    );
+
+    QVBoxLayout* layout = new QVBoxLayout(dlg);
+    layout->setContentsMargins(0, 0, 0, 20);
+    layout->setSpacing(0);
+
+    // Header banner
+    QFrame* banner = new QFrame();
+    banner->setFixedHeight(72);
+    banner->setStyleSheet(
+        "background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #667eea,stop:1 #764ba2);"
+        "border-top-left-radius:4px; border-top-right-radius:4px;");
+    QHBoxLayout* bannerL = new QHBoxLayout(banner);
+    bannerL->setContentsMargins(20, 0, 20, 0);
+    QLabel* ico = new QLabel("DB");
+    ico->setStyleSheet("font-size:18px; font-weight:bold; color:white; background:transparent;");
+    QLabel* bannerTitle = new QLabel("Database Backup Manager");
+    bannerTitle->setStyleSheet(
+        "font-size:16px; font-weight:bold; color:white; background:transparent;");
+    QLabel* dbPathLbl = new QLabel(dbPath);
+    dbPathLbl->setStyleSheet(
+        "font-size:11px; color:rgba(255,255,255,0.75); background:transparent;");
+    QVBoxLayout* titleCol = new QVBoxLayout();
+    titleCol->setSpacing(2);
+    titleCol->addWidget(bannerTitle);
+    titleCol->addWidget(dbPathLbl);
+    bannerL->addWidget(ico);
+    bannerL->addSpacing(10);
+    bannerL->addLayout(titleCol);
+    bannerL->addStretch();
+    layout->addWidget(banner);
+    layout->addSpacing(14);
+
+    QLabel* folderLabel = new QLabel(
+        QString("  Backup folder: <b>%1</b>").arg(backupDir));
+    folderLabel->setTextFormat(Qt::RichText);
+    folderLabel->setStyleSheet("font-size:12px; color:#495057; margin-left:16px;");
+    layout->addWidget(folderLabel);
+    layout->addSpacing(8);
+
+    // Backup list table
+    QTableWidget* backupTable = new QTableWidget();
+    backupTable->setObjectName("styledTable");
+    backupTable->setColumnCount(3);
+    backupTable->setHorizontalHeaderLabels({ "Backup File", "Created", "Size" });
+    backupTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    backupTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    backupTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    backupTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    backupTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    backupTable->verticalHeader()->setVisible(false);
+    backupTable->setAlternatingRowColors(true);
+
+    auto populateBackups = [=]() {
+        backupTable->setRowCount(0);
+        QStringList files = bDir.entryList(QStringList() << "backup_*.db",
+            QDir::Files, QDir::Name | QDir::Reversed);
+        for (int i = 0; i < files.size(); ++i) {
+            QFileInfo fi(backupDir + "/" + files[i]);
+            backupTable->insertRow(i);
+            backupTable->setItem(i, 0, new QTableWidgetItem(fi.fileName()));
+            backupTable->setItem(i, 1, new QTableWidgetItem(
+                fi.lastModified().toString("yyyy-MM-dd  hh:mm")));
+            double kb = fi.size() / 1024.0;
+            QString sz = kb < 1024
+                ? QString("%1 KB").arg(kb, 0, 'f', 1)
+                : QString("%1 MB").arg(kb / 1024.0, 0, 'f', 2);
+            backupTable->setItem(i, 2, new QTableWidgetItem(sz));
+            if (fi.fileName().contains(QDate::currentDate().toString("yyyy-MM-dd"))) {
+                for (int col = 0; col < 3; ++col) {
+                    backupTable->item(i, col)->setBackground(QColor(220, 248, 228));
+                    backupTable->item(i, col)->setForeground(QColor(25, 135, 84));
+                }
+            }
+        }
+        if (backupTable->rowCount() == 0) {
+            backupTable->insertRow(0);
+            QTableWidgetItem* empty = new QTableWidgetItem(
+                "No backups found — click Backup Now to create one.");
+            empty->setForeground(QColor("#6c757d"));
+            backupTable->setItem(0, 0, empty);
+            backupTable->setSpan(0, 0, 1, 3);
+        }
+        };
+    populateBackups();
+
+    QFrame* tw = new QFrame();
+    tw->setContentsMargins(16, 0, 16, 0);
+    QVBoxLayout* twl = new QVBoxLayout(tw);
+    twl->setContentsMargins(0, 0, 0, 0);
+    twl->addWidget(backupTable);
+    layout->addWidget(tw);
+    layout->addSpacing(14);
+
+    // Buttons
+    QHBoxLayout* btnRow = new QHBoxLayout();
+    btnRow->setContentsMargins(16, 0, 16, 0);
+    btnRow->setSpacing(10);
+    QPushButton* backupNowBtn = new QPushButton("Backup Now");
+    backupNowBtn->setObjectName("backupNowBtn");   backupNowBtn->setMinimumHeight(40);
+    QPushButton* restoreBtn = new QPushButton("Restore Selected");
+    restoreBtn->setObjectName("restoreBtn");        restoreBtn->setMinimumHeight(40);
+    QPushButton* deleteBackupBtn = new QPushButton("Delete Selected");
+    deleteBackupBtn->setObjectName("deleteBackupBtn"); deleteBackupBtn->setMinimumHeight(40);
+    QPushButton* closeBackupBtn = new QPushButton("Close");
+    closeBackupBtn->setObjectName("closeBackupBtn"); closeBackupBtn->setMinimumHeight(40);
+    btnRow->addWidget(backupNowBtn);
+    btnRow->addWidget(restoreBtn);
+    btnRow->addWidget(deleteBackupBtn);
+    btnRow->addStretch();
+    btnRow->addWidget(closeBackupBtn);
+    layout->addLayout(btnRow);
+
+    // Backup Now
+    connect(backupNowBtn, &QPushButton::clicked, dlg, [=]() {
+        QDir().mkpath(backupDir);
+        QString ts = QDateTime::currentDateTime().toString("yyyy-MM-dd_HH-mm-ss");
+        QString dest = backupDir + "/backup_" + ts + ".db";
+        if (QFile::copy(dbPath, dest)) {
+            QMessageBox::information(dlg, "Backup Created",
+                "Backup saved:\n" + dest);
+            populateBackups();
+        }
+        else {
+            QMessageBox::critical(dlg, "Backup Failed",
+                "Could not create backup.\nCheck folder permissions:\n" + backupDir);
+        }
+        });
+
+    // Restore Selected
+    connect(restoreBtn, &QPushButton::clicked, dlg, [=]() {
+        int row = backupTable->currentRow();
+        if (row < 0 || !backupTable->item(row, 0) ||
+            backupTable->item(row, 0)->text().startsWith("No backups")) {
+            QMessageBox::warning(dlg, "No Selection",
+                "Please select a backup file from the list."); return;
+        }
+        QString sel = backupTable->item(row, 0)->text();
+        QString src = backupDir + "/" + sel;
+        if (!QFile::exists(src)) {
+            QMessageBox::warning(dlg, "File Not Found",
+                "Selected backup no longer exists."); return;
+        }
+        auto reply = QMessageBox::warning(dlg, "Confirm Restore",
+            "This will REPLACE your current database with:\n\n" + sel +
+            "\n\nThe app will close after restoring. Are you sure?",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (reply != QMessageBox::Yes) return;
+
+        QString conn = QSqlDatabase::database().connectionName();
+        QSqlDatabase::database().close();
+        QSqlDatabase::removeDatabase(conn);
+
+        QString safety = dbPath + ".before_restore";
+        QFile::remove(safety);
+        QFile::copy(dbPath, safety);
+        QFile::remove(dbPath);
+
+        if (QFile::copy(src, dbPath)) {
+            QMessageBox::information(dlg, "Restore OK",
+                "Database restored.\nPlease restart the application.");
+        }
+        else {
+            QFile::copy(safety, dbPath);
+            QMessageBox::critical(dlg, "Restore Failed",
+                "Restore failed. Original database kept.\nPlease restart the application.");
+        }
+        QApplication::quit();
+        });
+
+    // Delete Selected
+    connect(deleteBackupBtn, &QPushButton::clicked, dlg, [=]() {
+        int row = backupTable->currentRow();
+        if (row < 0 || !backupTable->item(row, 0) ||
+            backupTable->item(row, 0)->text().startsWith("No backups")) {
+            QMessageBox::warning(dlg, "No Selection",
+                "Please select a backup to delete."); return;
+        }
+        QString fn = backupTable->item(row, 0)->text();
+        auto reply = QMessageBox::question(dlg, "Confirm Delete",
+            "Delete backup:\n" + fn + "\n\nThis cannot be undone.",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (reply == QMessageBox::Yes) {
+            QFile::remove(backupDir + "/" + fn);
+            populateBackups();
+        }
+        });
+
+    connect(closeBackupBtn, &QPushButton::clicked, dlg, &QDialog::accept);
+    dlg->exec();
 }
